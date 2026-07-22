@@ -57,7 +57,10 @@ class PredictResponse(BaseModel):
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # CKPT_PATH is where the model WILL be loaded from once step (1) above is implemented.
-    # Surfaced now so a misconfigured mount fails loudly at startup rather than per-request.
+    # Only recorded here (not validated) so the scaffold still boots without a checkpoint —
+    # that's deliberate: it lets ROS-side wiring be tested against the live transport before any
+    # model exists. The present-and-exists check belongs with the model-loading code in step (1),
+    # which is where a missing/bad path should fail loudly.
     app.state.ckpt_path = os.environ.get('CKPT_PATH')
     yield
 
@@ -76,7 +79,10 @@ def predict_cartesian(req: PredictRequest) -> PredictResponse:
     """Not yet implemented — see module docstring for the three deferred pieces."""
     missing = REQUIRED_OBS_KEYS - req.observations.keys()
     if missing:
-        raise HTTPException(status_code=422, detail=f'Missing observation keys: {missing}')
+        # sorted() so the message is deterministic (set ordering is not) — keeps client-side
+        # assertions/tests stable.
+        detail = f'Missing observation keys: {sorted(missing)}'
+        raise HTTPException(status_code=422, detail=detail)
     raise HTTPException(
         status_code=501,
         detail=(
