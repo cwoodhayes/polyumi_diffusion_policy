@@ -35,13 +35,19 @@ RUN micromamba run -n umi pip install --no-cache-dir \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.32"
 
-# Pin protobuf to what wandb 0.15.8's generated stubs expect. A newer protobuf (pulled
-# transitively by ray) leaves wandb.proto.wandb_internal_pb2 without its `Result` symbol, so
-# `import wandb` — which the training workspace does unconditionally, even offline — fails at
-# startup. Kept in its own layer after env-create so that expensive layer stays cached. The
+# Pin transitive deps that UMI's 2023-era libraries need but a present-day solve floats too new.
+# conda_environment.yaml pins the top-level libs (wandb 0.15.8, diffusers 0.18.2, timm 0.9.7)
+# but not these transitives, so conda-forge resolves them to current versions that broke the
+# pinned libs:
+#   - protobuf: newer versions leave wandb.proto.wandb_internal_pb2 without `Result`, so
+#     `import wandb` (done unconditionally by the training workspace, even offline) crashes.
+#   - huggingface_hub: >=0.26 removed `cached_download`, which diffusers 0.18.2 imports at load.
+# Kept in a layer after env-create so that ~23-min conda solve stays cached. The
 # google-api-core / proto-plus "requires protobuf>=4" pip warnings are from ray cloud features
 # training does not use.
-RUN micromamba run -n umi pip install --no-cache-dir "protobuf==3.20.3"
+RUN micromamba run -n umi pip install --no-cache-dir \
+        "protobuf==3.20.3" \
+        "huggingface_hub==0.16.4"
 
 # Project code. The dataset and output/checkpoint dirs are bind-mounted at run time (see
 # .dockerignore and the run wrapper), not copied — native I/O speed, no image bloat.
