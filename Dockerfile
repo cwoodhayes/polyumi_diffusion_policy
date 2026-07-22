@@ -35,6 +35,14 @@ RUN micromamba run -n umi pip install --no-cache-dir \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.32"
 
+# Pin protobuf to what wandb 0.15.8's generated stubs expect. A newer protobuf (pulled
+# transitively by ray) leaves wandb.proto.wandb_internal_pb2 without its `Result` symbol, so
+# `import wandb` — which the training workspace does unconditionally, even offline — fails at
+# startup. Kept in its own layer after env-create so that expensive layer stays cached. The
+# google-api-core / proto-plus "requires protobuf>=4" pip warnings are from ray cloud features
+# training does not use.
+RUN micromamba run -n umi pip install --no-cache-dir "protobuf==3.20.3"
+
 # Project code. The dataset and output/checkpoint dirs are bind-mounted at run time (see
 # .dockerignore and the run wrapper), not copied — native I/O speed, no image bloat.
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /app
