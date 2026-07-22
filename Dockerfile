@@ -12,29 +12,25 @@
 ARG MICROMAMBA_VERSION=1.5.8
 FROM mambaorg/micromamba:${MICROMAMBA_VERSION}
 
-# System libraries required by the eval-only pip deps in conda_environment.yaml:
-#   libspnav-dev                                   -> spnav (spacemouse teleop)
-#   libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf -> free-mujoco-py / robosuite
-# These are NOT needed for training (our env_runner is the no-op RealPushTImageRunner). When the
-# fork is pruned (PolyUMI plan Step 4) they can be removed alongside those deps. apt runs as
-# build-time root even under rootless Docker, so no host sudo is involved.
+# libGL for headless OpenCV: the conda py-opencv imports libGL.so.1 at load, which a slim base
+# lacks. The sim/teleop system libs (libspnav-dev, mesa/mujoco) are gone with the eval-only pip
+# deps they served (see conda_environment.yaml). apt runs as build-time root even under rootless
+# Docker, so no host sudo is involved.
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libspnav-dev \
-        libosmesa6-dev \
         libgl1-mesa-glx \
-        libglfw3 \
-        patchelf \
     && rm -rf /var/lib/apt/lists/*
 USER $MAMBA_USER
 
-# Create the 'umi' env from the upstream spec, left unmodified so it stays a clean mirror.
+# Create the 'umi' env. conda_environment.yaml is UMI's spec minus the real-robot/sim/teleop pip
+# deps (they don't build cleanly here and nothing on the training/inference path imports them —
+# see the note in that file).
 COPY --chown=$MAMBA_USER:$MAMBA_USER conda_environment.yaml /tmp/conda_environment.yaml
 RUN micromamba env create -y -f /tmp/conda_environment.yaml \
     && micromamba clean --all --yes
 
-# Server deps layered on top rather than added to the yaml, so the fork's conda_environment.yaml
-# keeps mirroring UMI exactly. fastapi/uvicorn are tiny and don't perturb the DP dep tree.
+# Server deps layered on top rather than added to the yaml. fastapi/uvicorn are tiny and don't
+# perturb the DP dep tree.
 RUN micromamba run -n umi pip install --no-cache-dir \
         "fastapi>=0.115" \
         "uvicorn[standard]>=0.32"
