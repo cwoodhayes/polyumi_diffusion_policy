@@ -87,11 +87,15 @@ def wire_to_obs_dict(
     rel_start = convert_pose_mat_rep(pose_mat, start_mat, pose_rep=POSE_REPR, backward=False)
     o9_start = mat_to_pose10d(rel_start)  # [To, 9]
 
+    # NB: the two rot keys say "axis_angle" but carry **rot6d** (6 values), not a 3-vec axis-angle.
+    # The names come verbatim from the model's shape_meta (obs are named after the raw replay-buffer
+    # fields, which UmiDataset then runs through a rotation_transformer to rot6d before the policy
+    # sees them); we must key by those exact strings. Don't "fix" the names or truncate to 3.
     obs = {
         'camera0_rgb': np.moveaxis(image, -1, 1),  # [To, 3, H, W], no /255 (already [0,1])
         'robot0_eef_pos': o9[:, :3],  # [To, 3]
-        'robot0_eef_rot_axis_angle': o9[:, 3:],  # [To, 6] rot6d
-        'robot0_eef_rot_axis_angle_wrt_start': o9_start[:, 3:],  # [To, 6] rot6d
+        'robot0_eef_rot_axis_angle': o9[:, 3:],  # [To, 6] rot6d (see note above re: name)
+        'robot0_eef_rot_axis_angle_wrt_start': o9_start[:, 3:],  # [To, 6] rot6d (see note above)
         'robot0_gripper_width': agent_pos[:, 7:8],  # [To, 1]
     }
     # Add the batch dim and cast to the float32 the policy expects.

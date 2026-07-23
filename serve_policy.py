@@ -84,7 +84,8 @@ def _load_policy(ckpt_path: str):
     import torch
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    payload = torch.load(open(ckpt_path, 'rb'), pickle_module=dill, map_location='cpu')
+    with open(ckpt_path, 'rb') as f:
+        payload = torch.load(f, pickle_module=dill, map_location='cpu')
     cfg = payload['cfg']
     workspace = hydra.utils.get_class(cfg._target_)(cfg)
     workspace.load_payload(payload)
