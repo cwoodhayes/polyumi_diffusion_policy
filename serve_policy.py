@@ -135,7 +135,13 @@ def reset(req: ResetRequest) -> dict:
         raise HTTPException(
             status_code=422, detail=f'agent_pos must have length {AGENT_POS_DIM}'
         )
-    app.state.demo_start_pose6 = agent_pos_to_pose6(np.asarray(req.agent_pos))
+    # A malformed pose (e.g. a zero-norm quaternion) makes Rotation.from_quat raise; that's a
+    # bad request, not a server fault, so surface it as 422 rather than letting it 500.
+    try:
+        pose6 = agent_pos_to_pose6(np.asarray(req.agent_pos, dtype=np.float64))
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=422, detail=f'Invalid agent_pos: {e}') from e
+    app.state.demo_start_pose6 = pose6
     return {'status': 'ok', 'episode_start_set': True}
 
 
@@ -172,7 +178,11 @@ def _decode_obs(req: PredictRequest) -> tuple[np.ndarray, np.ndarray]:
             status_code=422,
             detail=f'agent_pos must have shape [{req.n_obs_steps}, {AGENT_POS_DIM}]',
         )
-    return image_arr, np.asarray(agent_pos, dtype=np.float64)
+    try:
+        agent_pos_arr = np.asarray(agent_pos, dtype=np.float64)
+    except (ValueError, TypeError) as e:  # non-numeric entries -> bad request, not a 500
+        raise HTTPException(status_code=422, detail=f'agent_pos must be numeric: {e}') from e
+    return image_arr, agent_pos_arr
 
 
 @app.post('/predict_cartesian/', response_model=PredictResponse)
