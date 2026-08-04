@@ -1,9 +1,12 @@
 # PolyUMI task config. Derived from task/umi.yaml; kept as close to it as possible so any
 # failure is our data, not a config divergence. Only three things change from umi.yaml:
 #   - name / task_name          -> polyumi
-#   - obs_down_sample_steps 3->6 -> our data is stored at the native GoPro rate (~59.94 Hz);
-#                                   59.94/6 = 9.99 Hz, matching the 10 Hz ROS control loop.
-#                                   (Storage rate is set by the exporter; THIS sets obs rate.)
+#   - obs_down_sample_steps      -> back to UMI's 3, because since pzarr v4 the exporter stores
+#                                   only the frames SLAM was fed (localization_frame_stride 2,
+#                                   so ~29.97 Hz, not the native 59.94). 29.97/3 = 9.99 Hz,
+#                                   still the 10 Hz ROS control loop. This was 6 while we
+#                                   exported at native rate; the two must move together, since
+#                                   the stored rate times this factor IS the obs rate.
 #   - dataset_path               -> the exported .zarr.zip, bind-mounted into the container.
 #
 # shape_meta is intentionally identical to UMI's, including robot0_eef_rot_axis_angle_wrt_start
@@ -17,8 +20,8 @@ name: polyumi
 camera_obs_latency: 0.125
 robot_obs_latency: 0.0001
 gripper_obs_latency: 0.02
-dataset_frequeny: 0 #59.94
-obs_down_sample_steps: 6 # 59.94/6 ~= 10 Hz, matching the ROS control loop
+dataset_frequeny: 0 #29.97
+obs_down_sample_steps: 3 # 29.97/3 ~= 10 Hz, matching the ROS control loop
 
 low_dim_obs_horizon: 2
 img_obs_horizon: 2
