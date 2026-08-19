@@ -31,11 +31,12 @@ client must ``POST /reset`` with the start pose once per rollout; it is cached h
 import base64
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from serve_obs import (
@@ -45,7 +46,13 @@ from serve_obs import (
     wire_to_obs_dict,
 )
 
-logger = logging.getLogger('serve_policy')
+# A child of uvicorn's own logger, NOT a bare getLogger('serve_policy'). Uvicorn configures
+# handlers for the 'uvicorn*' loggers only and leaves the root logger bare, so a top-level logger
+# here propagates to a root with no handler and every INFO line is silently discarded — which is
+# why 'loaded policy from ...' has never appeared in the container output. Hanging off
+# 'uvicorn.error' inherits uvicorn's handler and format, so these lines interleave with the
+# access log instead of needing a --log-config of their own.
+logger = logging.getLogger('uvicorn.error').getChild('serve_policy')
 
 AGENT_POS_DIM = 8
 REQUIRED_OBS_KEYS = {'image', 'agent_pos'}
@@ -114,6 +121,34 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title='PolyUMI Inference Server', lifespan=_lifespan)
+
+
+@app.middleware('http')
+async def _log_request_time(request: Request, call_next):
+    """
+    Log how long each request took to serve, split into total and model time.
+
+    The client already measures its own round trip (``inference=NNNms`` in policy_client_node's
+    action-chunk line), but that number bundles network, serialization and compute together, so a
+    slow tick is indistinguishable from a slow link. Uvicorn's access log can't close the gap —
+    its message format is fixed and carries no duration — so time it here.
+
+    Two numbers because they fail for different reasons and have different fixes. ``total`` minus
+    ``model`` is base64 decode + JSON + FastAPI overhead, which scales with the observation
+    payload; ``model`` is GPU work, which on a shared box scales with whoever else is running.
+    Read against the client's round trip, the pair separates all three: if total ~ the client's
+    number, the link is fine and the box is the problem.
+    """
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    total_ms = (time.perf_counter() - t0) * 1e3
+    model_ms = getattr(request.state, 'model_ms', None)
+    model = f', model {model_ms:.0f}ms' if model_ms is not None else ''
+    logger.info(
+        '%s %s -> %d in %.0f ms%s', request.method, request.url.path,
+        response.status_code, total_ms, model,
+    )
+    return response
 
 
 @app.get('/health')
@@ -186,7 +221,7 @@ def _decode_obs(req: PredictRequest) -> tuple[np.ndarray, np.ndarray]:
 
 
 @app.post('/predict_cartesian/', response_model=PredictResponse)
-def predict_cartesian(req: PredictRequest) -> PredictResponse:
+def predict_cartesian(request: Request, req: PredictRequest) -> PredictResponse:
     """Run the policy on one observation window and return an absolute EEF action chunk."""
     import torch
 
@@ -202,9 +237,14 @@ def predict_cartesian(req: PredictRequest) -> PredictResponse:
     obs_np = wire_to_obs_dict(image_arr, agent_pos, demo_start_pose6=start6)
     obs_dict = {k: torch.from_numpy(v).to(app.state.device) for k, v in obs_np.items()}
 
+    # Timed through the .cpu() call, not just predict_action: CUDA kernels launch asynchronously,
+    # so stopping the clock at the end of the `with` block would measure queueing, not diffusion.
+    # The copy back to host is the synchronization point, and thus the honest end of the work.
+    t_model = time.perf_counter()
     with torch.no_grad():
         action_pred = app.state.policy.predict_action(obs_dict)['action_pred']
     action_pred = action_pred[0].detach().cpu().numpy()  # [Ta, 10] relative to current pose
+    request.state.model_ms = (time.perf_counter() - t_model) * 1e3
 
     # The current EEF pose (agent_pos[-1]) is the base the policy's chunk is relative to.
     base_pose_mat = agent_pos_to_pose_mat(agent_pos)[-1]
