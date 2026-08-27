@@ -4,13 +4,16 @@ Inference server for the PolyUMI visuomotor diffusion policy.
 Serves a trained checkpoint over the same HTTP contract the ROS-side ``policy_client_node``
 already speaks to ``inference_server/dummy_server.py``:
 
-    POST /predict_cartesian/
-      {n_obs_steps, n_action_steps,
-       observations: {image: {dtype, shape, data(b64)}, agent_pos: [[8]]}}
+    POST /predict_cartesian/   Content-Type: application/octet-stream
+      one binary frame: [4B header length][JSON header][channel blobs]   -- see obs_wire
+      channels: camera0_rgb [To,H,W,3] uint8, agent_pos [To,8] float64
     -> {actions: [[8]], n_action_steps, server_total_ms, model_ms}
 
-    ``image`` is ``[To, H, W, 3]`` uint8 (what the dataset stores and what the client sends);
-    a float array already normalized to [0, 1] is accepted too. See ``serve_obs``.
+    ``camera0_rgb`` is uint8 -- what the dataset stores and what the client sends; a float array
+    already normalized to [0, 1] is accepted too (see ``serve_obs``). The frame format can carry
+    any subset of channels, for modalities that update slower than the control loop, but a request
+    omitting a required one is REFUSED rather than filled in; ``obs_wire.require_channels``
+    explains why.
 
     POST /reset  {agent_pos: [8]}          # cache the episode-start EEF pose (see below)
     GET  /health
@@ -31,7 +34,6 @@ client must ``POST /reset`` with the start pose once per rollout; it is cached h
 ``/predict_cartesian/`` falls back to the current pose (``wrt_start`` -> identity) and warns.
 """
 
-import base64
 import logging
 import os
 import time
@@ -39,9 +41,10 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import Body, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
+from obs_wire import WireFormatError, require_channels, unpack_observation
 from serve_obs import (
     actions_rel_to_abs,
     agent_pos_to_pose6,
@@ -58,15 +61,9 @@ from serve_obs import (
 logger = logging.getLogger('uvicorn.error').getChild('serve_policy')
 
 AGENT_POS_DIM = 8
-REQUIRED_OBS_KEYS = {'image', 'agent_pos'}
-
-
-class PredictRequest(BaseModel):
-    """Request body for /predict_cartesian/ — mirrors the dummy server's contract."""
-
-    n_obs_steps: Annotated[int, Field(ge=1)] = 2
-    n_action_steps: Annotated[int, Field(ge=1)] = 1
-    observations: dict
+#: Channels the policy cannot run without. Named for the dataset's own fields, so wiring a new
+#: modality is adding a name here and in shape_meta rather than reshaping the request.
+REQUIRED_CHANNELS = ('camera0_rgb', 'agent_pos')
 
 
 class PredictResponse(BaseModel):
@@ -193,52 +190,59 @@ def reset(req: ResetRequest) -> dict:
     return {'status': 'ok', 'episode_start_set': True}
 
 
-def _decode_obs(req: PredictRequest) -> tuple[np.ndarray, np.ndarray]:
-    """Validate + decode the wire observation into (image [To,H,W,3], agent_pos [To,8])."""
-    missing = REQUIRED_OBS_KEYS - req.observations.keys()
-    if missing:
-        raise HTTPException(status_code=422, detail=f'Missing observation keys: {sorted(missing)}')
+def _decode_obs(body: bytes) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Decode one request frame into (camera0_rgb [To,H,W,3], agent_pos [To,8], n_action_steps).
 
-    image = req.observations['image']
-    if not isinstance(image, dict) or not {'dtype', 'shape', 'data'} <= image.keys():
-        raise HTTPException(
-            status_code=422, detail="image must be a dict with 'dtype', 'shape', 'data'"
-        )
+    Every rejection is a 422: a frame this server cannot read is a bad request, not a fault here.
+    """
     try:
-        image_arr = np.frombuffer(
-            base64.b64decode(image['data']), dtype=np.dtype(image['dtype'])
-        ).reshape(image['shape'])
-    except Exception as e:  # noqa: BLE001 - surface any decode failure as a 422
-        raise HTTPException(status_code=422, detail=f'Failed to decode image: {e}') from e
-    if image_arr.shape[0] != req.n_obs_steps:
+        channels, header = unpack_observation(body)
+        require_channels(channels, REQUIRED_CHANNELS)
+    except WireFormatError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    image_arr = channels['camera0_rgb']
+    agent_pos = channels['agent_pos']
+    n_obs_steps = header.get('n_obs_steps')
+
+    # The header's window length and the arrays' leading dim are two independent claims about the
+    # same thing; a mismatch means the client packed something other than what it says it packed.
+    for name, arr in (('camera0_rgb', image_arr), ('agent_pos', agent_pos)):
+        if arr.shape[0] != n_obs_steps:
+            raise HTTPException(
+                status_code=422,
+                detail=f'{name} leading dim must be n_obs_steps={n_obs_steps}, got {arr.shape[0]}',
+            )
+    if image_arr.ndim != 4 or image_arr.shape[-1] != 3:
+        raise HTTPException(
+            status_code=422, detail=f'camera0_rgb must be [To,H,W,3], got {list(image_arr.shape)}'
+        )
+    if agent_pos.ndim != 2 or agent_pos.shape[1] != AGENT_POS_DIM:
         raise HTTPException(
             status_code=422,
-            detail=f'image leading dim must be n_obs_steps={req.n_obs_steps}, got {image_arr.shape[0]}',
+            detail=f'agent_pos must be [To,{AGENT_POS_DIM}], got {list(agent_pos.shape)}',
         )
 
-    agent_pos = req.observations['agent_pos']
-    if (
-        not isinstance(agent_pos, list)
-        or len(agent_pos) != req.n_obs_steps
-        or not all(isinstance(row, list) and len(row) == AGENT_POS_DIM for row in agent_pos)
-    ):
+    n_action_steps = header.get('n_action_steps')
+    if not isinstance(n_action_steps, int) or n_action_steps < 1:
         raise HTTPException(
-            status_code=422,
-            detail=f'agent_pos must have shape [{req.n_obs_steps}, {AGENT_POS_DIM}]',
+            status_code=422, detail=f'n_action_steps must be a positive int, got {n_action_steps!r}'
         )
-    try:
-        agent_pos_arr = np.asarray(agent_pos, dtype=np.float64)
-    except (ValueError, TypeError) as e:  # non-numeric entries -> bad request, not a 500
-        raise HTTPException(status_code=422, detail=f'agent_pos must be numeric: {e}') from e
-    return image_arr, agent_pos_arr
+    # float64 because agent_pos_to_pose_mat builds rotations from it; the wire dtype is the
+    # client's business, the precision the pose maths needs is ours.
+    return image_arr, np.asarray(agent_pos, dtype=np.float64), n_action_steps
 
 
 @app.post('/predict_cartesian/', response_model=PredictResponse)
-def predict_cartesian(request: Request, req: PredictRequest) -> PredictResponse:
+def predict_cartesian(
+    request: Request,
+    body: Annotated[bytes, Body(media_type='application/octet-stream')],
+) -> PredictResponse:
     """Run the policy on one observation window and return an absolute EEF action chunk."""
     import torch
 
-    image_arr, agent_pos = _decode_obs(req)
+    image_arr, agent_pos, n_action_steps = _decode_obs(body)
 
     start6 = app.state.demo_start_pose6
     if start6 is None:
@@ -265,7 +269,7 @@ def predict_cartesian(request: Request, req: PredictRequest) -> PredictResponse:
 
     # Return at most the requested count; further truncation is the client's job (UMI's policy
     # emits the full horizon with no offset).
-    n_return = min(req.n_action_steps, actions_abs.shape[0])
+    n_return = min(n_action_steps, actions_abs.shape[0])
     t_start = getattr(request.state, 't_request_start', None)
     return PredictResponse(
         actions=actions_abs[:n_return].tolist(),
