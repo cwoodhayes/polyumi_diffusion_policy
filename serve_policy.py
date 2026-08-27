@@ -7,7 +7,10 @@ already speaks to ``inference_server/dummy_server.py``:
     POST /predict_cartesian/
       {n_obs_steps, n_action_steps,
        observations: {image: {dtype, shape, data(b64)}, agent_pos: [[8]]}}
-    -> {actions: [[8]], n_action_steps}
+    -> {actions: [[8]], n_action_steps, server_total_ms, model_ms}
+
+    ``image`` is ``[To, H, W, 3]`` uint8 (what the dataset stores and what the client sends);
+    a float array already normalized to [0, 1] is accepted too. See ``serve_obs``.
 
     POST /reset  {agent_pos: [8]}          # cache the episode-start EEF pose (see below)
     GET  /health
@@ -71,6 +74,13 @@ class PredictResponse(BaseModel):
 
     actions: list[list[float]]
     n_action_steps: int
+    #: Wall time this process spent on the request, in ms — the same number the access log
+    #: prints. The client subtracts it from its own round trip to get network + serialization,
+    #: which is the only way to tell a slow link from a busy box without instrumenting both.
+    #: Nullable so a client can distinguish "the server did not say" from "it was zero".
+    server_total_ms: float | None = None
+    #: The forward pass alone, in ms, measured through the .cpu() sync point.
+    model_ms: float | None = None
 
 
 class ResetRequest(BaseModel):
@@ -140,6 +150,9 @@ async def _log_request_time(request: Request, call_next):
     number, the link is fine and the box is the problem.
     """
     t0 = time.perf_counter()
+    # Also handed to the endpoint, which puts it in the response body: the log is for a human
+    # reading this box, the wire field is for the client plotting the split live.
+    request.state.t_request_start = t0
     response = await call_next(request)
     total_ms = (time.perf_counter() - t0) * 1e3
     model_ms = getattr(request.state, 'model_ms', None)
@@ -253,4 +266,10 @@ def predict_cartesian(request: Request, req: PredictRequest) -> PredictResponse:
     # Return at most the requested count; further truncation is the client's job (UMI's policy
     # emits the full horizon with no offset).
     n_return = min(req.n_action_steps, actions_abs.shape[0])
-    return PredictResponse(actions=actions_abs[:n_return].tolist(), n_action_steps=n_return)
+    t_start = getattr(request.state, 't_request_start', None)
+    return PredictResponse(
+        actions=actions_abs[:n_return].tolist(),
+        n_action_steps=n_return,
+        server_total_ms=None if t_start is None else (time.perf_counter() - t_start) * 1e3,
+        model_ms=request.state.model_ms,
+    )

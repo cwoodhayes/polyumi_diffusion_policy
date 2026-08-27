@@ -69,7 +69,7 @@ def test_obs_keys_shapes_dtypes():
 
 
 def test_camera_channel_first_no_rescale():
-    # Image already in [0,1]; server must only move the channel axis, never divide by 255.
+    # A float image is already in [0,1]; the server must only move the channel axis for it.
     rng = np.random.default_rng(1)
     image = rng.uniform(0, 1, (TO, H, W, 3)).astype(np.float32)
     agent_pos = _sample_agent_pos(rng)
@@ -77,6 +77,22 @@ def test_camera_channel_first_no_rescale():
     cam = wire_to_obs_dict(image, agent_pos)['camera0_rgb'][0]  # [To,3,H,W]
     assert np.allclose(cam, np.moveaxis(image, -1, 1))
     assert cam.max() <= 1.0
+
+
+def test_camera_uint8_normalized_here():
+    # The client sends uint8 (a quarter of float32's bytes, and the dtype the dataset stores),
+    # so the /255 happens here instead. Same values, not merely close ones: the two paths must be
+    # indistinguishable to the policy or the wire change is a silent train/inference skew.
+    rng = np.random.default_rng(11)
+    image_u8 = rng.integers(0, 256, (TO, H, W, 3), dtype=np.uint8)
+    agent_pos = _sample_agent_pos(rng)
+
+    from_u8 = wire_to_obs_dict(image_u8, agent_pos)['camera0_rgb']
+    from_f32 = wire_to_obs_dict(image_u8.astype(np.float32) / 255.0, agent_pos)['camera0_rgb']
+
+    assert np.array_equal(from_u8, from_f32)
+    assert from_u8.dtype == np.float32
+    assert from_u8.max() <= 1.0
 
 
 def test_main_obs_is_relative_to_current_pose():

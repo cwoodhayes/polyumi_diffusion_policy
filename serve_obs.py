@@ -54,7 +54,9 @@ def wire_to_obs_dict(
     Translate one wire observation into the UMI policy's obs dict (batched ``[1, To, ...]``).
 
     Args:
-        image: ``[To, H, W, 3]`` float in ``[0, 1]`` (already normalized client-side).
+        image: ``[To, H, W, 3]``. ``uint8`` in ``[0, 255]`` — what the dataset stores and what
+            the client puts on the wire — or a float already normalized to ``[0, 1]``. Integer
+            input is divided by 255 here; the two paths are bit-identical.
         agent_pos: ``[To, 8]`` absolute EEF poses ``[x, y, z, qx, qy, qz, qw, gripper]``.
         demo_start_pose6: cached episode-start pose ``[6]`` (pos + axis-angle) set via
             ``POST /reset``. ``None`` falls back to the current pose, which makes
@@ -65,7 +67,14 @@ def wire_to_obs_dict(
         dict of ``np.float32`` arrays keyed by the exact ``shape_meta`` obs names.
 
     """
-    image = np.asarray(image, dtype=np.float32)
+    image = np.asarray(image)
+    if np.issubdtype(image.dtype, np.integer):
+        # The client sends uint8 because float32 is four times the bytes for no extra information
+        # (the dataset itself stores camera0_rgb as uint8). Normalizing here rather than there is
+        # the same arithmetic on the same values, so the policy cannot tell which side did it.
+        image = image.astype(np.float32) / 255.0
+    else:
+        image = image.astype(np.float32)
     agent_pos = np.asarray(agent_pos, dtype=np.float64)
 
     pose_mat = agent_pos_to_pose_mat(agent_pos)  # [To, 4, 4]
@@ -92,7 +101,7 @@ def wire_to_obs_dict(
     # fields, which UmiDataset then runs through a rotation_transformer to rot6d before the policy
     # sees them); we must key by those exact strings. Don't "fix" the names or truncate to 3.
     obs = {
-        'camera0_rgb': np.moveaxis(image, -1, 1),  # [To, 3, H, W], no /255 (already [0,1])
+        'camera0_rgb': np.moveaxis(image, -1, 1),  # [To, 3, H, W], already [0,1]
         'robot0_eef_pos': o9[:, :3],  # [To, 3]
         'robot0_eef_rot_axis_angle': o9[:, 3:],  # [To, 6] rot6d (see note above re: name)
         'robot0_eef_rot_axis_angle_wrt_start': o9_start[:, 3:],  # [To, 6] rot6d (see note above)
