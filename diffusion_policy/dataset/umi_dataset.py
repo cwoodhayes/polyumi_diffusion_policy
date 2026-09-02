@@ -1,4 +1,5 @@
 import copy
+import hashlib
 from typing import Dict, Optional
 
 import os
@@ -26,6 +27,27 @@ from umi.common.pose_util import pose_to_mat, mat_to_pose10d
 
 register_codecs()
 
+
+def get_load_keys(shape_meta, dataset_path):
+    """
+    Data keys this dataset actually reads, so extra streams in the store cost nothing.
+
+    A PolyUMI export carries mic_0 / finger_rgb next to the visuomotor keys; without this
+    filter ReplayBuffer copies every one of them into memory (or the LMDB cache) for a config
+    that never samples them. Kept: the keys shape_meta names, minus the *_wrt_* ones this
+    dataset derives at load time, plus the demo poses it derives them from and a stored action
+    if there is one (SequenceSampler synthesises the action only when the key is absent).
+    """
+    with zarr.ZipStore(dataset_path, mode='r') as zip_store:
+        available = list(zarr.open_group(zip_store, mode='r')['data'].array_keys())
+    wanted = {key for key in shape_meta['obs'] if 'wrt' not in key}
+    wanted.add('action')
+    return [
+        key for key in available
+        if key in wanted
+        or key.endswith('_demo_start_pose') or key.endswith('_demo_end_pose')
+    ]
+
 class UmiDataset(BaseDataset):
     def __init__(self,
         shape_meta: dict,
@@ -43,12 +65,15 @@ class UmiDataset(BaseDataset):
         self.obs_pose_repr = self.pose_repr.get('obs_pose_repr', 'rel')
         self.action_pose_repr = self.pose_repr.get('action_pose_repr', 'rel')
         
+        load_keys = get_load_keys(shape_meta, dataset_path)
+
         if cache_dir is None:
             # load into memory store
             with zarr.ZipStore(dataset_path, mode='r') as zip_store:
                 replay_buffer = ReplayBuffer.copy_from_store(
                     src_store=zip_store, 
-                    store=zarr.MemoryStore()
+                    store=zarr.MemoryStore(),
+                    keys=load_keys
                 )
         else:
             # TODO: refactor into a stand alone function?
@@ -56,7 +81,10 @@ class UmiDataset(BaseDataset):
             mod_time = os.path.getmtime(dataset_path)
             stamp = datetime.fromtimestamp(mod_time).isoformat()
             stem_name = os.path.basename(dataset_path).split('.')[0]
-            cache_name = '_'.join([stem_name, stamp])
+            # the key set is part of the cache's identity: one .zarr.zip feeds several
+            # configs (visuomotor / multimodal), and they load different keys from it.
+            keys_id = hashlib.md5(','.join(load_keys).encode()).hexdigest()[:8]
+            cache_name = '_'.join([stem_name, stamp, keys_id])
             cache_dir = pathlib.Path(os.path.expanduser(cache_dir))
             cache_dir.mkdir(parents=True, exist_ok=True)
             cache_path = cache_dir.joinpath(cache_name + '.zarr.mdb')
@@ -75,7 +103,8 @@ class UmiDataset(BaseDataset):
                                 print(f"Copying data to {str(cache_path)}")
                                 ReplayBuffer.copy_from_store(
                                     src_store=zip_store,
-                                    store=lmdb_store
+                                    store=lmdb_store,
+                                    keys=load_keys
                                 )
                         print("Cache written to disk!")
                     except Exception as e:
