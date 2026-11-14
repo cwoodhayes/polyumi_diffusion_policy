@@ -1,6 +1,8 @@
-# Copy of train_diffusion_unet_timm_umi_workspace.yaml, differing only in the task group
-# (polyumi) and logging.project (polyumi). Kept a full copy rather than a defaults-inheritance
-# to match UMI's one-workspace-per-task convention and keep the run's provenance legible.
+# Copy of train_diffusion_unet_timm_polyumi_workspace.yaml, differing only in the task
+# group (polyumi_slip_t) -- kept as a full copy per the one-workspace-per-task convention of the
+# file it came from. Nothing below is unique to this file:
+#   --config-name=train_diffusion_unet_timm_polyumi_workspace task=polyumi_slip_t
+# composes an identical config, if a file per task is not wanted.
 defaults:
   - _self_
   - task: polyumi_slip_t

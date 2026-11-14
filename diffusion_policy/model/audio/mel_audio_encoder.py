@@ -7,10 +7,16 @@ the window is reassembled by concatenating them before any spectral transform --
 spectrogram per row would impose a 33.5 ms analysis boundary that has nothing to do with the
 signal, and would destroy exactly the onset structure a contact event lives in.
 
-The mel filterbank and STFT are built from torch primitives rather than torchaudio because neither
-torchaudio nor librosa is in `conda_environment.yaml`, and checkpoints are dill-pickled against the
-exact dependency tree -- adding a dependency invalidates every existing checkpoint for the sake of
-a filterbank that is twenty lines.
+Same row-concatenation strategy as `polyumi_vista_policy`'s `vista/preproc/log_mel.py`, and the
+same conv-BN-ReLU stem shape as its `vista/encoders/cnn.py` -- reimplemented here rather than
+shared, because the mel filterbank and STFT are built from torch primitives instead of torchaudio.
+Neither torchaudio nor librosa is in `conda_environment.yaml`, and checkpoints are dill-pickled
+against the exact dependency tree, so adding a dependency invalidates every existing checkpoint for
+the sake of a filterbank that is twenty lines.
+
+The parameters match ingest's `config/contact_audio.yaml` logmel block (ManiWAV's: 25 ms window,
+10 ms hop, 64 HTK mel bins). That block only shapes ingest's diagnostic spectrogram -- no policy
+reads it -- so the log-mel is recomputed here from the raw `mic_0` rows, not consumed from ingest.
 """
 
 # The policy container's conda env is python=3.9 (see CLAUDE.md), where `X | Y` in an annotation
@@ -24,7 +30,7 @@ import torch.nn as nn
 
 
 def hz_to_mel(f: torch.Tensor | float) -> torch.Tensor | float:
-    """Slaney-style hz->mel, matching librosa's default and the ingest-side log-mel."""
+    """HTK mel scale, matching ingest's logmel.py (librosa needs htk=True to agree)."""
     return 2595.0 * math.log10(1.0 + f / 700.0) if isinstance(f, float) else 2595.0 * torch.log10(1.0 + f / 700.0)
 
 
@@ -36,6 +42,10 @@ def mel_to_hz(m: torch.Tensor) -> torch.Tensor:
 def mel_filterbank(n_mels: int, n_fft: int, sample_rate: int, f_min: float, f_max: float) -> torch.Tensor:
     """
     Triangular mel filterbank of shape ``(n_mels, n_fft // 2 + 1)``.
+
+    Unnormalised: each triangle peaks at 1.0 rather than being scaled to unit area, which is the
+    Kaldi convention and what ingest's logmel.py builds. Area normalisation would shift the log by
+    a constant, so the two sides must agree on this.
 
     Built once at construction and registered as a buffer, so it moves with the module and costs
     nothing per forward.

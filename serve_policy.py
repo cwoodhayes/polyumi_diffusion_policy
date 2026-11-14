@@ -1,5 +1,10 @@
 """
-Inference server for the PolyUMI visuomotor diffusion policy.
+Inference server for a trained PolyUMI diffusion-policy checkpoint.
+
+Serves whatever the checkpoint was trained on -- visuomotor, +finger camera, +contact mic, or
+gripper-only. Which optional channels a request must carry is read from the checkpoint's own
+encoder, never from a flag here, so a visuomotor checkpoint keeps working when the client sends
+tactile channels and a tactile one refuses to run without them.
 
 The HTTP surface -- routes, the binary observation frame, the contract every request is checked
 against, timing -- belongs to ``polyumi_inference``, the library the ROS-side ``policy_client_node``
@@ -10,7 +15,9 @@ construction rather than by two people keeping two listings in step.
 
     POST /predict_cartesian/   Content-Type: application/octet-stream
       one binary frame: [4B header length][JSON header][channel blobs]
-      channels: camera0_rgb [To,H,W,3] uint8, agent_pos [To,8] float64
+      channels: agent_pos [To,8] float64, plus whatever the checkpoint declares --
+                camera0_rgb [To,H,W,3] uint8, finger_rgb [To,H,W,3] uint8,
+                mic_0 [rows,samples] float32
     -> {actions: [[8]], n_action_steps, server_total_ms, model_ms}
 
     POST /reset  {agent_pos: [8]}          # cache the episode-start EEF pose (see below)
@@ -23,6 +30,10 @@ Run it inside the training container (``docker/serve.sh``) -- that is the whole 
 image for both roles: the checkpoint is dill-pickled and must unpickle against the exact dependency
 tree it was trained with, and the ``umi`` conda env has both ``diffusion_policy``/torch and
 fastapi/uvicorn, so this process **direct-imports** the policy (no subprocess).
+
+EMA weights are served, with BatchNorm running statistics copied across from the trained model
+first -- ``EMAModel.step`` averages parameters only, so the EMA copy's buffers never tracked the
+data (see ``_sync_batchnorm_stats``).
 
 Two frame conversions happen here (see ``serve_obs.py``):
   - obs: absolute wire poses -> UMI's relative, rot6d, name-matched obs dict.
@@ -150,15 +161,10 @@ class UmiPolicyBackend:
                 'Set -e CKPT_PATH=/data/checkpoints/<name>.ckpt and mount the checkpoint dir.'
             )
         policy, device, gripper_repr = _load_policy(ckpt_path)
-        # Which extra channels this checkpoint wants is a property of the CHECKPOINT, read from the
-        # shape_meta it was trained with -- not a flag, and not something the client can assert.
-        # A visuomotor checkpoint must keep working unchanged when the client happens to send
-        # tactile channels, and a tactile one must refuse to run without them rather than quietly
-        # encoding whatever it finds.
         # From the ENCODER, not the policy: DiffusionUnetTimmPolicy takes shape_meta as a
         # constructor argument but never stores it, so asking the policy silently yields an empty
-        # set and every optional channel is dropped. The encoder's own key lists are the most
-        # direct source available -- they are literally what its forward() iterates over.
+        # set and every optional channel is dropped. The encoder's own key lists are literally
+        # what its forward() iterates over.
         encoder = getattr(policy, 'obs_encoder', None)
         wanted = (
             set(getattr(encoder, 'rgb_keys', ()))
@@ -205,13 +211,12 @@ class UmiPolicyBackend:
             if key not in self._wanted_keys:
                 continue
             if key not in obs:
+                # names(), not sorted(obs): Observation defines __getitem__ and __contains__ but no
+                # __iter__, so sorting it falls back to the legacy __getitem__(0) protocol and dies
+                # with KeyError: 0 -- the error handler crashing instead of reporting the error.
                 raise KeyError(
                     f'checkpoint {self._ckpt_path} was trained with {key!r} but the observation '
                     f'does not carry it; the client has send_tactile off, or is older than this '
-                    # names(), not sorted(obs): Observation defines __getitem__ and __contains__
-                    # but no __iter__, so sorting it falls back to the legacy __getitem__(0)
-                    # protocol and dies with KeyError: 0 -- the error handler crashing instead of
-                    # reporting the error.
                     f'checkpoint. Wire keys present: {obs.names()}'
                 )
             if target == 'finger_rgb':

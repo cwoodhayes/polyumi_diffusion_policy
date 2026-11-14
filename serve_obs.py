@@ -2,14 +2,18 @@
 Observation/action translation between the ROS wire contract and the UMI policy.
 
 The ROS-side ``policy_client_node`` speaks the same HTTP contract as ``dummy_server``: absolute
-EEF poses as ``[x, y, z, qx, qy, qz, qw, gripper]`` (quaternion, robot base frame) plus a stacked
-image. The UMI policy consumes a *different* obs dict — name-matched keys, rotations as ``rot6d``,
+EEF poses as ``[x, y, z, qx, qy, qz, qw, gripper]`` (quaternion, robot base frame), plus whatever
+image and tactile channels the checkpoint declares -- all of them optional, since a gripper-only
+policy has no ``camera0_rgb`` at all. The UMI policy consumes a *different* obs dict — name-matched keys, rotations as ``rot6d``,
 poses expressed relative to the current EEF pose. These pure-numpy functions do that translation
 both ways so they can be unit-tested without a checkpoint or a GPU; ``serve_policy.py`` wraps them
 with torch/device handling.
 
 The transform mirrors ``UmiDataset.__getitem__`` (diffusion_policy/dataset/umi_dataset.py) for the
-single-robot case. ``pose_repr`` is ``relative`` for both obs and action (task/polyumi.yaml).
+single-robot case. ``pose_repr`` is ``relative`` for both obs and action (task/polyumi.yaml). A
+gripper-only task declares no pose keys, so none of that applies and the width is the whole action;
+whether it is absolute or a delta is ``action_gripper_repr``, which ``serve_policy`` reads off the
+checkpoint.
 
 Note on ``mat_to_pose10d``: despite the name it returns **9** values (pos[3] + rot6d[6]); the
 policy's 10-D action is that 9-vec plus a trailing gripper scalar.
