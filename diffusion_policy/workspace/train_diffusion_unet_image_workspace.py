@@ -326,7 +326,16 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             step_log['val_loss'] = val_loss
                 
                 def log_action_mse(step_log, category, pred_action, gt_action):
-                    B, T, _ = pred_action.shape
+                    B, T, D = pred_action.shape
+                    if D == 1:
+                        # Gripper-only: the action is a single width column. There is no
+                        # [pos3, rot6d, width] layout to split, so the overall error and the
+                        # width error are the same number -- both are logged so a run can be
+                        # compared against a full-action one on either key.
+                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                        step_log[f'{category}_action_mse_error'] = mse
+                        step_log[f'{category}_action_mse_error_width'] = mse
+                        return
                     pred_action = pred_action.view(B, T, -1, 10)
                     gt_action = gt_action.view(B, T, -1, 10)
                     step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)

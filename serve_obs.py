@@ -2,14 +2,18 @@
 Observation/action translation between the ROS wire contract and the UMI policy.
 
 The ROS-side ``policy_client_node`` speaks the same HTTP contract as ``dummy_server``: absolute
-EEF poses as ``[x, y, z, qx, qy, qz, qw, gripper]`` (quaternion, robot base frame) plus a stacked
-image. The UMI policy consumes a *different* obs dict — name-matched keys, rotations as ``rot6d``,
+EEF poses as ``[x, y, z, qx, qy, qz, qw, gripper]`` (quaternion, robot base frame), plus whatever
+image and tactile channels the checkpoint declares -- all of them optional, since a gripper-only
+policy has no ``camera0_rgb`` at all. The UMI policy consumes a *different* obs dict — name-matched keys, rotations as ``rot6d``,
 poses expressed relative to the current EEF pose. These pure-numpy functions do that translation
 both ways so they can be unit-tested without a checkpoint or a GPU; ``serve_policy.py`` wraps them
 with torch/device handling.
 
 The transform mirrors ``UmiDataset.__getitem__`` (diffusion_policy/dataset/umi_dataset.py) for the
-single-robot case. ``pose_repr`` is ``relative`` for both obs and action (task/polyumi.yaml).
+single-robot case. ``pose_repr`` is ``relative`` for both obs and action (task/polyumi.yaml). A
+gripper-only task declares no pose keys, so none of that applies and the width is the whole action;
+whether it is absolute or a delta is ``action_gripper_repr``, which ``serve_policy`` reads off the
+checkpoint.
 
 Note on ``mat_to_pose10d``: despite the name it returns **9** values (pos[3] + rot6d[6]); the
 policy's 10-D action is that 9-vec plus a trailing gripper scalar.
@@ -46,15 +50,18 @@ def agent_pos_to_pose_mat(agent_pos: np.ndarray) -> np.ndarray:
 
 
 def wire_to_obs_dict(
-    image: np.ndarray,
+    image: np.ndarray | None,
     agent_pos: np.ndarray,
     demo_start_pose6: np.ndarray | None = None,
+    finger_rgb: np.ndarray | None = None,
+    mic_0: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Translate one wire observation into the UMI policy's obs dict (batched ``[1, To, ...]``).
 
     Args:
-        image: ``[To, H, W, 3]``. ``uint8`` in ``[0, 255]`` — what the dataset stores and what
+        image: ``[To, H, W, 3]`` or ``None`` when the policy has no camera0_rgb (gripper-only).
+            ``uint8`` in ``[0, 255]`` — what the dataset stores and what
             the client puts on the wire — or a float already normalized to ``[0, 1]``. Integer
             input is divided by 255 here; the two paths are bit-identical.
         agent_pos: ``[To, 8]`` absolute EEF poses ``[x, y, z, qx, qy, qz, qw, gripper]``.
@@ -62,18 +69,24 @@ def wire_to_obs_dict(
             ``POST /reset``. ``None`` falls back to the current pose, which makes
             ``robot0_eef_rot_axis_angle_wrt_start`` collapse to identity — an approximation
             (see serve_policy.py) rather than the trained signal.
+        finger_rgb: ``[To, H, W, 3]`` finger-camera frames, same dtype convention as ``image``.
+            ``None`` omits the key, which is what a visuomotor checkpoint wants.
+        mic_0: ``[rows, samples]`` raw contact-mic waveform. Its leading dim is audio ROWS
+            (``audio_obs_horizon``), not ``To`` — the model's audio encoder consumes the window
+            whole — so it is batched but never reshaped to the observation horizon.
 
     Returns:
         dict of ``np.float32`` arrays keyed by the exact ``shape_meta`` obs names.
 
     """
-    image = np.asarray(image)
-    if np.issubdtype(image.dtype, np.integer):
+    if image is not None:
+        image = np.asarray(image)
+    if image is not None and np.issubdtype(image.dtype, np.integer):
         # The client sends uint8 because float32 is four times the bytes for no extra information
         # (the dataset itself stores camera0_rgb as uint8). Normalizing here rather than there is
         # the same arithmetic on the same values, so the policy cannot tell which side did it.
         image = image.astype(np.float32) / 255.0
-    else:
+    elif image is not None:
         image = image.astype(np.float32)
     agent_pos = np.asarray(agent_pos, dtype=np.float64)
 
@@ -101,12 +114,28 @@ def wire_to_obs_dict(
     # fields, which UmiDataset then runs through a rotation_transformer to rot6d before the policy
     # sees them); we must key by those exact strings. Don't "fix" the names or truncate to 3.
     obs = {
-        'camera0_rgb': np.moveaxis(image, -1, 1),  # [To, 3, H, W], already [0,1]
         'robot0_eef_pos': o9[:, :3],  # [To, 3]
         'robot0_eef_rot_axis_angle': o9[:, 3:],  # [To, 6] rot6d (see note above re: name)
         'robot0_eef_rot_axis_angle_wrt_start': o9_start[:, 3:],  # [To, 6] rot6d (see note above)
         'robot0_gripper_width': agent_pos[:, 7:8],  # [To, 1]
     }
+    if image is not None:
+        obs['camera0_rgb'] = np.moveaxis(image, -1, 1)  # [To, 3, H, W], already [0,1]
+    # Tactile channels, added only when the caller supplies them, so one function serves both a
+    # visuomotor checkpoint and a tactile+audio one. Each reproduces exactly what UmiDataset does
+    # at training time -- finger_rgb through the same channel-move and /255 as camera0_rgb
+    # (umi_dataset.py:312), mic_0 passed through untouched under an identity normalizer. Anything
+    # else here is train/serve skew: the shapes still match, so nothing raises, and the policy
+    # merely receives a distribution it never saw.
+    if finger_rgb is not None:
+        finger = np.asarray(finger_rgb)
+        if np.issubdtype(finger.dtype, np.integer):
+            finger = finger.astype(np.float32) / 255.0
+        else:
+            finger = finger.astype(np.float32)
+        obs['finger_rgb'] = np.moveaxis(finger, -1, 1)  # [To, 3, H, W]
+    if mic_0 is not None:
+        obs['mic_0'] = np.asarray(mic_0, dtype=np.float32)  # [rows, samples]
     # Add the batch dim and cast to the float32 the policy expects.
     return {k: v[None].astype(np.float32) for k, v in obs.items()}
 

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision
 import logging
 
+from diffusion_policy.model.audio.mel_audio_encoder import MelAudioEncoder
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 from diffusion_policy.common.pytorch_util import replace_submodules
@@ -78,6 +79,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         
         rgb_keys = list()
         low_dim_keys = list()
+        audio_keys = list()
         key_model_map = nn.ModuleDict()
         key_transform_map = nn.ModuleDict()
         key_shape_map = dict()
@@ -134,16 +136,32 @@ class TimmObsEncoder(ModuleAttrMixin):
             shape = tuple(attr['shape'])
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
-                assert image_shape is None or image_shape == shape[1:]
-                image_shape = shape[1:]
-        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
-            assert transforms[0].type == 'RandomCrop'
-            ratio = transforms[0].ratio
-            transforms = [
-                torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True)
-            ] + transforms[1:]
-        transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+                # `resize` lets a key arrive at its native resolution and be brought to the shared
+                # encoder input here rather than at export. The dataset then keeps full detail on
+                # disk -- you can always downsample into the model, never the reverse -- while the
+                # backbone still sees one shape, which is what the rest of this class assumes
+                # (feature_map_shape, AttentionPool2d and spatial_embedding are all built from it).
+                effective = tuple(attr['resize']) if attr.get('resize') else shape[1:]
+                assert image_shape is None or image_shape == effective, (
+                    f"rgb key {key!r} resolves to {effective}, but another key resolves to "
+                    f"{image_shape}; give it a matching `resize` in shape_meta")
+                image_shape = effective
+        # image_shape is None whenever shape_meta has no rgb key at all (an audio-only or
+        # low_dim-only obs set) -- the crop/resize sizing below only means anything for an image,
+        # so skip it entirely rather than index None. `transform` still needs a value: the loop
+        # below only ever attaches it to an rgb key's entry in key_transform_map, so on this path
+        # it is built but never actually applied to anything.
+        if image_shape is not None:
+            if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
+                assert transforms[0].type == 'RandomCrop'
+                ratio = transforms[0].ratio
+                transforms = [
+                    torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
+                    torchvision.transforms.Resize(size=image_shape[0], antialias=True)
+                ] + transforms[1:]
+            transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+        else:
+            transform = nn.Identity()
 
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
@@ -155,20 +173,45 @@ class TimmObsEncoder(ModuleAttrMixin):
                 this_model = model if share_rgb_model else copy.deepcopy(model)
                 key_model_map[key] = this_model
 
-                this_transform = transform
+                resize = attr.get('resize')
+                if resize:
+                    this_transform = torch.nn.Sequential(
+                        torchvision.transforms.Resize(size=tuple(resize), antialias=True), transform
+                    )
+                else:
+                    this_transform = transform
                 key_transform_map[key] = this_transform
             elif type == 'low_dim':
                 if not attr.get('ignore_by_policy', False):
                     low_dim_keys.append(key)
+            elif type == 'audio':
+                # Contact mic. Its own encoder rather than an rgb model: the input is a raw
+                # waveform, and its leading dim is audio rows (audio_obs_horizon), not the
+                # observation horizon the image keys use.
+                audio_keys.append(key)
+                key_model_map[key] = MelAudioEncoder(
+                    samples_per_row=shape[-1],
+                    sample_rate=attr.get('sample_rate', 16000),
+                    n_mels=attr.get('n_mels', 64),
+                    out_dim=attr.get('out_dim', 128),
+                    f_min=attr.get('f_min', 1000.0),
+                )
             else:
                 raise RuntimeError(f"Unsupported obs type: {type}")
         
-        feature_map_shape = [x // downsample_ratio for x in image_shape]
+        # Only meaningful with at least one rgb key; unused downstream when there is none (a ViT
+        # backbone forces feature_aggregation to None a few lines below, and every other
+        # aggregation branch that reads it is keyed off an rgb-only feature_aggregation setting).
+        feature_map_shape = (
+            [x // downsample_ratio for x in image_shape] if image_shape is not None else None
+        )
             
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
+        audio_keys = sorted(audio_keys)
         print('rgb keys:         ', rgb_keys)
         print('low_dim_keys keys:', low_dim_keys)
+        print('audio keys:       ', audio_keys)
 
         self.model_name = model_name
         self.shape_meta = shape_meta
@@ -177,6 +220,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         self.share_rgb_model = share_rgb_model
         self.rgb_keys = rgb_keys
         self.low_dim_keys = low_dim_keys
+        self.audio_keys = audio_keys
         self.key_shape_map = key_shape_map
         self.feature_aggregation = feature_aggregation
         if model_name.startswith('vit'):
@@ -268,6 +312,14 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature = self.aggregate_feature(raw_feature)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T
             features.append(feature.reshape(B, -1))
+
+        # process audio input. Not reshaped to (B*T) like the image keys: the encoder consumes the
+        # whole row window at once, because the rows are contiguous in time and the onset structure
+        # a contact lives in straddles row boundaries.
+        for key in self.audio_keys:
+            data = obs_dict[key]
+            assert data.shape[0] == batch_size
+            features.append(self.key_model_map[key](data))
 
         # process lowdim input
         for key in self.low_dim_keys:

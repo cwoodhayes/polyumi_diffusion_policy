@@ -100,6 +100,18 @@ class SequenceSampler:
                     key = f'robot{robot_idx}_{cat}'
                     if key in self.replay_buffer:
                         actions.append(self.replay_buffer[key])
+            if not actions:
+                # Gripper-only policy: shape_meta declares no eef_pos, so num_robot is 0 and the
+                # loop above contributes nothing. The action is the gripper width alone. Concatenating
+                # an empty list would raise here instead, which is a confusing place to learn that
+                # the task config omitted the pose keys on purpose.
+                gripper = [k for k in self.replay_buffer if k.endswith('gripper_width')]
+                if not gripper:
+                    raise RuntimeError(
+                        'no action could be built: shape_meta declares no *_eef_pos (so no pose '
+                        'action) and the replay buffer has no *_gripper_width either'
+                    )
+                actions = [self.replay_buffer[sorted(gripper)[0]]]
             self.replay_buffer['action'] = np.concatenate(actions, axis=-1)
 
         self.action_padding = action_padding

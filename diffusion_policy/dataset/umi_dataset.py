@@ -64,6 +64,11 @@ class UmiDataset(BaseDataset):
         self.pose_repr = pose_repr
         self.obs_pose_repr = self.pose_repr.get('obs_pose_repr', 'rel')
         self.action_pose_repr = self.pose_repr.get('action_pose_repr', 'rel')
+        # Gripper-only counterpart to action_pose_repr. 'abs' (the default) predicts the width
+        # itself; 'relative' predicts the CHANGE from the width observed at t_obs. Only consulted
+        # when num_robot == 0 -- a full action already carries its gripper column through the
+        # pose-relative path, and re-basing it here would double-count.
+        self.action_gripper_repr = self.pose_repr.get('action_gripper_repr', 'abs')
         
         load_keys = get_load_keys(shape_meta, dataset_path)
 
@@ -120,6 +125,7 @@ class UmiDataset(BaseDataset):
         self.num_robot = 0
         rgb_keys = list()
         lowdim_keys = list()
+        audio_keys = list()
         key_horizon = dict()
         key_down_sample_steps = dict()
         key_latency_steps = dict()
@@ -131,6 +137,15 @@ class UmiDataset(BaseDataset):
                 rgb_keys.append(key)
             elif type == 'low_dim':
                 lowdim_keys.append(key)
+            elif type == 'audio':
+                # Rides the low-dim SAMPLING path -- it is a numeric array the sampler slices by
+                # horizon like any other -- but the model does not treat it as low-dim: the encoder
+                # reads its type from shape_meta and routes it to MelAudioEncoder rather than
+                # concatenating the raw waveform into the feature vector. Without this branch the
+                # key matches neither arm and is dropped silently, which surfaces only as a policy
+                # that ignores the contact mic.
+                lowdim_keys.append(key)
+                audio_keys.append(key)
 
             if key.endswith('eef_pos'):
                 self.num_robot += 1
@@ -166,8 +181,14 @@ class UmiDataset(BaseDataset):
     
         for key in replay_buffer.keys():
             if key.endswith('_demo_start_pose') or key.endswith('_demo_end_pose'):
-                self.sampler_lowdim_keys.append(key)
                 query_key = key.split('_')[0] + '_eef_pos'
+                if query_key not in shape_meta['obs']:
+                    # Gripper-only: shape_meta declares no pose key, so there is no horizon to
+                    # borrow here. Every --type polyumi buffer still carries the demo poses, and
+                    # __getitem__ drops them before building the action, so skip them outright
+                    # rather than sampling a key nothing can size.
+                    continue
+                self.sampler_lowdim_keys.append(key)
                 key_horizon[key] = shape_meta['obs'][query_key]['horizon']
                 key_latency_steps[key] = shape_meta['obs'][query_key]['latency_steps']
                 key_down_sample_steps[key] = shape_meta['obs'][query_key]['down_sample_steps']
@@ -189,6 +210,7 @@ class UmiDataset(BaseDataset):
         self.replay_buffer = replay_buffer
         self.rgb_keys = rgb_keys
         self.lowdim_keys = lowdim_keys
+        self.audio_keys = audio_keys
         self.key_horizon = key_horizon
         self.key_latency_steps = key_latency_steps
         self.key_down_sample_steps = key_down_sample_steps
@@ -245,15 +267,21 @@ class UmiDataset(BaseDataset):
                 data_cache[key] = data_cache[key].reshape(B*T, D)
 
         # action
-        assert data_cache['action'].shape[-1] % self.num_robot == 0
-        dim_a = data_cache['action'].shape[-1] // self.num_robot
-        action_normalizers = list()
-        for i in range(self.num_robot):
-            action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a: i * dim_a + 3])))              # pos
-            action_normalizers.append(get_identity_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a + 3: (i + 1) * dim_a - 1]))) # rot
-            action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., (i + 1) * dim_a - 1: (i + 1) * dim_a])))  # gripper
+        if self.num_robot == 0:
+            # Gripper-only policy: the action is a single width column, so it gets the same range
+            # normalizer the gripper would have received inside the per-robot split below. The
+            # split itself cannot run -- num_robot is 0, and `% self.num_robot` would divide by zero.
+            normalizer['action'] = get_range_normalizer_from_stat(array_to_stats(data_cache['action']))
+        else:
+            assert data_cache['action'].shape[-1] % self.num_robot == 0
+            dim_a = data_cache['action'].shape[-1] // self.num_robot
+            action_normalizers = list()
+            for i in range(self.num_robot):
+                action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a: i * dim_a + 3])))              # pos
+                action_normalizers.append(get_identity_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a + 3: (i + 1) * dim_a - 1]))) # rot
+                action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., (i + 1) * dim_a - 1: (i + 1) * dim_a])))  # gripper
 
-        normalizer['action'] = concatenate_normalizer(action_normalizers)
+            normalizer['action'] = concatenate_normalizer(action_normalizers)
 
         # obs
         for key in self.lowdim_keys:
@@ -267,6 +295,12 @@ class UmiDataset(BaseDataset):
                 this_normalizer = get_identity_normalizer_from_stat(stat)
             elif key.endswith('gripper_width'):
                 this_normalizer = get_range_normalizer_from_stat(stat)
+            elif key in self.audio_keys:
+                # Identity, not range. A waveform's 536 columns are successive time offsets, not
+                # semantic channels, so per-column min/max scaling would apply 536 unrelated gains
+                # to one signal and destroy its shape. Level is carried by the log in the mel
+                # front end instead.
+                this_normalizer = get_identity_normalizer_from_stat(stat)
             else:
                 raise RuntimeError('unsupported')
             normalizer[key] = this_normalizer
@@ -392,7 +426,17 @@ class UmiDataset(BaseDataset):
             obs_dict[f'robot{robot_id}_eef_pos'] = obs_pose[:,:3]
             obs_dict[f'robot{robot_id}_eef_rot_axis_angle'] = obs_pose[:,3:]
             
-        data['action'] = np.concatenate(actions, axis=-1)
+        if self.num_robot:
+            data['action'] = np.concatenate(actions, axis=-1)
+        elif self.action_gripper_repr == 'relative':
+            # Gripper-only, relative: predict the change from the width at t_obs rather than the
+            # width itself. obs_dict['robot0_gripper_width'] is [To, 1] and its last row is the
+            # observation the chunk is conditioned on, so it is the same base the serving side
+            # adds back. get_normalizer iterates this class through a DataLoader, so the action
+            # normalizer is fitted on the deltas automatically -- nothing else needs telling.
+            data['action'] = data['action'] - obs_dict['robot0_gripper_width'][-1]
+        # else: gripper-only and absolute -- data['action'] is already the single width column the
+        # sampler built, and there is no pose to make relative, so it passes through untouched.
         
         torch_data = {
             'obs': dict_apply(obs_dict, torch.from_numpy),
